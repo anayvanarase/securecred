@@ -76,8 +76,6 @@ Hyperparameter tuning via Optuna (TPE Sampler, 3-fold stratified CV)
     ↓
 Best model selected by ROC-AUC → serialized to fraud_model.joblib
     ↓
-Bayesian probability calibration applied at inference
-    ↓
 Adjustable decision threshold (default 0.75, tunable from dashboard)
 ```
 
