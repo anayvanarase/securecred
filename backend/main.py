@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import joblib
 import os
+import io
 from datetime import datetime
 
 app = FastAPI(title="Real-Time Fraud Detection API")
@@ -44,18 +45,40 @@ class TransactionInput(BaseModel):
     txn_weekday: int
     is_weekend: int
     is_night_txn: int
-    avg_txn_amount_30d: float = 500  # Some defs for derived feats
+    avg_txn_amount_30d: float = 500
     credit_limit_inr: float = 50000
     std_txn_amount_30d: float = 100
+    distance_from_home_km: float = 5.0
+    card_age_days: int = 365
+    velocity_last_1h: int = 1
+    velocity_last_24h: int = 5
 
 class PredictionResponse(BaseModel):
     fraud_probability: float
     prediction: str
     risk_level: str
     explanation: list
+    investigation_summary: str
+    status: str
+
+class BulkPredictionResponse(BaseModel):
+    total_processed: int
+    fraud_detected: int
+    results: list
+
+class RuleInput(BaseModel):
+    field: str
+    operator: str
+    value: float
+    action: str
+
+class ActionUpdate(BaseModel):
+    id: int
+    status: str
 
 # In-memory store
 transactions = []
+dynamic_rules = []
 stats = {
     "total_transactions": 0,
     "fraud_count": 0,
@@ -70,6 +93,17 @@ def derive_features(tx: dict) -> dict:
     tx_copy['international_high_amount'] = 1 if (tx_copy['is_international'] == 1 and tx_copy['transaction_amount_inr'] > 1000) else 0
     tx_copy['amount_zscore'] = (tx_copy['transaction_amount_inr'] - tx_copy['avg_txn_amount_30d']) / (tx_copy['std_txn_amount_30d'] + 1)
     tx_copy['is_large_txn'] = 1 if tx_copy['amount_vs_avg_ratio'] > 3 else 0
+    
+    # Banking specific derivations
+    tx_copy['high_velocity'] = 1 if tx_copy.get('velocity_last_1h', 0) > 3 else 0
+    tx_copy['new_card_risk'] = 1 if tx_copy.get('card_age_days', 365) < 30 else 0
+    tx_copy['extreme_distance'] = 1 if tx_copy.get('distance_from_home_km', 0) > 500 else 0
+    
+    # Entry Mode Risk Weighting
+    # Manual entry is typically 10x riskier for Card-Not-Present fraud
+    tx_copy['is_manual_entry'] = 1 if tx_copy.get('pos_entry_mode') == 'manual' else 0
+    tx_copy['is_chip_entry'] = 1 if tx_copy.get('pos_entry_mode') == 'chip' else 0
+    
     return tx_copy
 
 def preprocess_input(tx_dict: dict):
@@ -111,11 +145,50 @@ def generate_explanation(tx_dict: dict, risk_level: str) -> list:
         reasons.append("Transaction amount is significantly higher than 30-day average.")
     if tx_dict.get('is_night_txn') == 1:
         reasons.append("Transaction occurred during high-risk hours (night).")
+    if tx_dict.get('distance_from_home_km', 0) > 500:
+        reasons.append(f"Extreme distance from home ({tx_dict.get('distance_from_home_km')} km).")
+    if tx_dict.get('velocity_last_1h', 0) > 3:
+        reasons.append(f"High transaction frequency detected ({tx_dict.get('velocity_last_1h')} in 1h).")
+    if tx_dict.get('card_age_days', 365) < 30:
+        reasons.append("New card with limited history.")
     
     if not reasons:
         reasons.append("Anomaly detected by ML model based on complex feature interactions.")
         
     return reasons
+
+def evaluate_rules(tx_dict: dict) -> list:
+    triggered_rules = []
+    for r in dynamic_rules:
+        fval = tx_dict.get(r['field'])
+        if fval is not None:
+            if r['operator'] == '>' and float(fval) > float(r['value']):
+                triggered_rules.append(r)
+            elif r['operator'] == '<' and float(fval) < float(r['value']):
+                triggered_rules.append(r)
+            elif r['operator'] == '==' and float(fval) == float(r['value']):
+                triggered_rules.append(r)
+    return triggered_rules
+
+def simulate_llm_investigator(tx_dict: dict, risk_level: str, is_fraud: bool, triggered_rules: list) -> str:
+    """Simulates an LLM summarizing the fraud parameters"""
+    amt = tx_dict.get('transaction_amount_inr', 0)
+    merchant = tx_dict.get('merchant_category', 'unknown').upper()
+    is_intl = 'an international' if tx_dict.get('is_international') == 1 else 'a domestic'
+    
+    summary = f"Agent AI Analysis: Transaction of {amt:,.2f} INR at {merchant} ({is_intl} location). "
+    
+    if triggered_rules:
+        summary += f"Automatically intercepted by Policy Rules ({len(triggered_rules)} rule(s) triggered). "
+    
+    if is_fraud:
+        summary += "The ML engine signals highly anomalous behavior comparing current spending velocity against historical patterns. Recommend immediate card freeze and 2FA authentication."
+    elif risk_level == "MEDIUM":
+        summary += "Moderate risk indicators present. Consider sending a soft verification SMS."
+    else:
+        summary += "Behavior aligns with normal cardholder baseline. No action required."
+        
+    return summary
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict(tx: TransactionInput, threshold: float = 0.5):
@@ -123,29 +196,45 @@ def predict(tx: TransactionInput, threshold: float = 0.5):
         tx_dict = tx.dict()
         tx_derived = derive_features(tx_dict)
         
-        if model_artifacts:
-            X_input = preprocess_input(tx_derived)
-            model = model_artifacts['model']
-            prob = float(model.predict_proba(X_input)[0, 1])
-        else:
-            # Fallback for testing frontend without model
-            prob = tx.transaction_amount_inr / 10000.0 if tx.transaction_amount_inr < 10000 else 0.99
-            
-        is_fraud = prob >= threshold
+        # Check dynamic rules first
+        triggered_rules = evaluate_rules(tx_derived)
+        rule_action = "BLOCK" if any(r['action'] == 'BLOCK' for r in triggered_rules) else None
         
-        risk_level = "LOW"
-        if prob > threshold:
-            risk_level = "HIGH"
-        elif prob > threshold * 0.7:
-            risk_level = "MEDIUM"
+        if rule_action == "BLOCK":
+            prob = 0.999 # Cap at 99.9% even for rules
+            is_fraud = True
+            risk_level = "CRITICAL (RULE)"
+        else:
+            if model_artifacts:
+                X_input = preprocess_input(tx_derived)
+                model = model_artifacts['model']
+                prob = float(model.predict_proba(X_input)[0, 1])
+            else:
+                # Fallback for testing frontend without model
+                prob = tx.transaction_amount_inr / 10000.0 if tx.transaction_amount_inr < 10000 else 0.99
+            
+            # Cap all probabilities to satisfy user preference for non-100% scores
+            prob = min(prob, 0.999)
+                
+            # Business Rule: Only automatically block HIGH risk items
+            is_fraud = prob > threshold
+            
+            risk_level = "LOW"
+            if prob > threshold:
+                risk_level = "HIGH"
+            elif prob > threshold * 0.6: # Expanded Medium range for better monitoring
+                risk_level = "MEDIUM"
 
         explanation = generate_explanation(tx_derived, risk_level)
+        llm_summary = simulate_llm_investigator(tx_derived, risk_level, is_fraud, triggered_rules)
         
         result = {
             "fraud_probability": round(prob, 4),
             "prediction": "FRAUD" if is_fraud else "LEGIT",
             "risk_level": risk_level,
-            "explanation": explanation
+            "explanation": explanation,
+            "investigation_summary": llm_summary,
+            "status": "pending"
         }
         
         # Save to DB
@@ -154,10 +243,11 @@ def predict(tx: TransactionInput, threshold: float = 0.5):
             "amount": tx.transaction_amount_inr,
             "merchant": tx.merchant_category,
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "country_code": tx.country_code,
             **result
         }
         transactions.insert(0, txn_record)
-        if len(transactions) > 100:
+        if len(transactions) > 5000:
             transactions.pop()
             
         stats["total_transactions"] += 1
@@ -176,6 +266,77 @@ def get_stats():
 @app.get("/transactions")
 def get_transactions():
     return transactions
+
+@app.post("/action")
+def update_action(update: ActionUpdate):
+    for t in transactions:
+        if t['id'] == update.id:
+            t['status'] = update.status
+            return {"success": True, "transaction": t}
+    raise HTTPException(status_code=404, detail="Transaction not found")
+
+@app.post("/rules")
+def add_rule(rule: RuleInput):
+    dynamic_rules.append(rule.model_dump() if hasattr(rule, 'model_dump') else rule.dict())
+    return {"status": "Rule added", "rules": dynamic_rules}
+
+@app.get("/rules")
+def get_rules_endpoint():
+    return dynamic_rules
+
+@app.post("/rules/clear")
+def clear_rules():
+    dynamic_rules.clear()
+    return {"status": "Rules cleared"}
+
+@app.post("/predict/bulk", response_model=BulkPredictionResponse)
+async def predict_bulk(file: UploadFile = File(...), threshold: float = 0.5):
+    content = await file.read()
+    if file.filename.endswith('.csv'):
+        df = pd.read_csv(io.BytesIO(content))
+    elif file.filename.endswith('.json'):
+        df = pd.read_json(io.BytesIO(content))
+    else:
+        raise HTTPException(status_code=400, detail="Only CSV or JSON files allowed.")
+
+    results = []
+    fraud_count = 0
+    
+    # Process rows
+    for _, row in df.iterrows():
+        # Map row to TransactionInput format
+        tx_data = row.to_dict()
+        # Handle default falls for missing cols in CSV
+        defaults = {
+            "is_international": 0, "country_code": "IN", "pos_entry_mode": "chip",
+            "txn_hour": 12, "txn_day": 1, "txn_month": 1, "txn_weekday": 1,
+            "is_weekend": 0, "is_night_txn": 0, "distance_from_home_km": 5.0,
+            "card_age_days": 365, "velocity_last_1h": 1, "velocity_last_24h": 5,
+            "avg_txn_amount_30d": 500, "credit_limit_inr": 50000, "std_txn_amount_30d": 100
+        }
+        full_data = {**defaults, **tx_data}
+        
+        # We simulate the validation here
+        try:
+            tx_obj = TransactionInput(**full_data)
+            pred = predict(tx_obj, threshold)
+            results.append({
+                "id": len(results) + 1,
+                "amount": tx_obj.transaction_amount_inr,
+                "merchant": tx_obj.merchant_category,
+                "prediction": pred['prediction'],
+                "risk_level": pred['risk_level']
+            })
+            if pred['prediction'] == "FRAUD":
+                fraud_count += 1
+        except Exception:
+            continue
+            
+    return {
+        "total_processed": len(results),
+        "fraud_detected": fraud_count,
+        "results": results
+    }
 
 @app.post("/simulate")
 def simulate(threshold: float = 0.5):
