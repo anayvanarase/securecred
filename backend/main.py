@@ -7,6 +7,36 @@ import os
 import io
 from datetime import datetime
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PROBABILITY CALIBRATION
+# The model was trained with scale_pos_weight / is_unbalance=True to handle
+# class imbalance during training. This causes raw predict_proba() scores to
+# be significantly inflated relative to the real-world fraud base rate (~2%).
+#
+# We apply Bayes' theorem to correct the posterior probability:
+#   P(fraud | score) = (score * real_prior / train_prior) /
+#                      (score * real_prior / train_prior  +
+#                       (1-score) * (1-real_prior) / (1-train_prior))
+#
+# REAL_FRAUD_PRIOR = 0.02  → only 2% of real-world transactions are fraud
+# TRAIN_FRAUD_PRIOR = 0.50 → model trained on ~50/50 balanced-equivalent data
+# ─────────────────────────────────────────────────────────────────────────────
+REAL_FRAUD_PRIOR  = 0.02   # real-world prevalence
+TRAIN_FRAUD_PRIOR = 0.50   # effective training prevalence (balanced weighting)
+
+def calibrate_probability(raw_prob: float) -> float:
+    """Bayesian prior correction: maps inflated model probabilities back to
+    real-world scale so that ~2% of transactions are flagged as high risk."""
+    eps = 1e-9  # avoid divide-by-zero
+    raw_prob = max(eps, min(1 - eps, raw_prob))
+    # Likelihood ratio of fraud vs legit at training prior
+    lr_fraud  = raw_prob / TRAIN_FRAUD_PRIOR
+    lr_legit  = (1 - raw_prob) / (1 - TRAIN_FRAUD_PRIOR)
+    # Posterior using real-world prior
+    numerator = lr_fraud * REAL_FRAUD_PRIOR
+    calibrated = numerator / (numerator + lr_legit * (1 - REAL_FRAUD_PRIOR))
+    return float(calibrated)
+
 app = FastAPI(title="Real-Time Fraud Detection API")
 
 # Setup CORS
@@ -191,7 +221,7 @@ def simulate_llm_investigator(tx_dict: dict, risk_level: str, is_fraud: bool, tr
     return summary
 
 @app.post("/predict", response_model=PredictionResponse)
-def predict(tx: TransactionInput, threshold: float = 0.5):
+def predict(tx: TransactionInput, threshold: float = 0.75):
     try:
         tx_dict = tx.dict()
         tx_derived = derive_features(tx_dict)
@@ -201,29 +231,40 @@ def predict(tx: TransactionInput, threshold: float = 0.5):
         rule_action = "BLOCK" if any(r['action'] == 'BLOCK' for r in triggered_rules) else None
         
         if rule_action == "BLOCK":
-            prob = 0.999 # Cap at 99.9% even for rules
+            prob = 0.999  # Cap at 99.9% even for rule-based blocks
             is_fraud = True
             risk_level = "CRITICAL (RULE)"
         else:
             if model_artifacts:
                 X_input = preprocess_input(tx_derived)
                 model = model_artifacts['model']
-                prob = float(model.predict_proba(X_input)[0, 1])
+                raw_prob = float(model.predict_proba(X_input)[0, 1])
             else:
                 # Fallback for testing frontend without model
-                prob = tx.transaction_amount_inr / 10000.0 if tx.transaction_amount_inr < 10000 else 0.99
+                raw_prob = tx.transaction_amount_inr / 10000.0 if tx.transaction_amount_inr < 10000 else 0.99
             
-            # Cap all probabilities to satisfy user preference for non-100% scores
+            # ── CALIBRATION ──────────────────────────────────────────────────
+            # The model was trained with class-imbalance compensation
+            # (scale_pos_weight / is_unbalance), which inflates raw scores.
+            # Correct back to the real-world ~2% fraud base rate.
+            prob = calibrate_probability(raw_prob)
+            
+            # Cap at 99.9% — certainty of exactly 100% is never appropriate
             prob = min(prob, 0.999)
-                
-            # Business Rule: Only automatically block HIGH risk items
-            is_fraud = prob > threshold
-            
-            risk_level = "LOW"
+
+            # ── RISK TIERING ─────────────────────────────────────────────────
+            # HIGH   : prob > threshold           → BLOCKED  (auto action)
+            # MEDIUM : prob > threshold * 0.55    → MONITORED (human review)
+            # LOW    : everything else            → APPROVED
             if prob > threshold:
                 risk_level = "HIGH"
-            elif prob > threshold * 0.6: # Expanded Medium range for better monitoring
+                is_fraud = True
+            elif prob > threshold * 0.55:
                 risk_level = "MEDIUM"
+                is_fraud = False  # Medium risk is monitored, never auto-blocked
+            else:
+                risk_level = "LOW"
+                is_fraud = False
 
         explanation = generate_explanation(tx_derived, risk_level)
         llm_summary = simulate_llm_investigator(tx_derived, risk_level, is_fraud, triggered_rules)
@@ -290,7 +331,7 @@ def clear_rules():
     return {"status": "Rules cleared"}
 
 @app.post("/predict/bulk", response_model=BulkPredictionResponse)
-async def predict_bulk(file: UploadFile = File(...), threshold: float = 0.5):
+async def predict_bulk(file: UploadFile = File(...), threshold: float = 0.75):
     content = await file.read()
     if file.filename.endswith('.csv'):
         df = pd.read_csv(io.BytesIO(content))
